@@ -33,6 +33,11 @@ enum class ConnectionPreset : uint8_t {
     LowPower,   // 30-60 ms, latency 10
 };
 
+enum class StatusLed : uint8_t {
+    None,
+    Rgb, // short overlays on the RGB status LED (default)
+};
+
 struct HidStatus {
     HidState state = HidState::Off;
     HidReason reason = HidReason::None;
@@ -86,6 +91,9 @@ public:
     BleHidClass& autoPairWhenEmpty(bool on);          // open pairing while there are no bonds (default)
     BleHidClass& battery(BatterySource source);
     BleHidClass& readyDeadline(uint32_t ms);          // how long input waits for a host (default 2000)
+    // Bluetooth status on the RGB LED (default), on a plain LED such as D7, or nowhere.
+    BleHidClass& statusLed(StatusLed mode);
+    BleHidClass& statusLed(uint16_t pin);
     // When the system part lacks the patch, begin() installs the patched
     // system part bundled as an asset (assetOtaDir=lib/particle-hid/assets)
     // and the device resets. Default on; does nothing without the asset.

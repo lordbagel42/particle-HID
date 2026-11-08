@@ -128,6 +128,17 @@ With no bonds, the device opens pairing on its own and advertises under your nam
 - **It coexists with cellular and the cloud.** On the Boron, `Particle.publish`, functions, and OTA keep working while HID is connected; the bring-up example uses all of them.
 - **USB HID stays available.** The classes are prefixed `BT` so Device OS's own USB `Keyboard` and `Mouse` still work in the same app.
 - **Your own BLE services work too.** Use Device OS's normal `BLE` API next to `BleHid`, over the same bonded connection. Add your characteristics **after** `BleHid.begin()`, so adding or changing them later doesn't move the HID attributes. When the attribute table changes, bonded hosts get Service Changed and rediscover it. [`examples/haven-badge`](examples/haven-badge/haven-badge.cpp) adds an LED characteristic, and [`tools/badge-led`](tools/badge-led/badge-led.swift) is a macOS CLI that sets it over the existing connection.
+- **Status LED.** The RGB LED shows Bluetooth events as short overlays, then goes back to the normal Device OS status (breathing cyan and so on). Listening mode, updates, `RGB.control(true)`, and Device OS's own important statuses take precedence; your own `LEDStatus` at `LED_PRIORITY_IMPORTANT` gets interrupted during an event.
+
+  | Pattern | Meaning |
+  | --- | --- |
+  | Blue double blink every 2 s | Pairing mode: advertising for a new host |
+  | 3 quick blue flashes | A known host connected and reports are flowing |
+  | Green for 1 s | A new host paired and is ready |
+  | 2 orange flashes | The host disconnected |
+  | 3 fast red flashes | Pairing was refused or failed (for example, outside the pairing window) |
+
+  `BleHid.statusLed(D7)` uses a plain LED instead: the same timing without colour, plus solid on while a host is connected and ready (so pick a pin your app doesn't use; the keyboard example uses D7 for Caps Lock). `BleHid.statusLed(StatusLed::None)` turns it off. Set these before `begin()`.
 - **Listening mode** takes over advertising while it's active. The library restores its own advertising afterwards (not yet tested on hardware).
 - **Storage:** bonds are kept in `/usr/phid` on the device's filesystem, one small file per host (204 bytes).
 - **Resources:** the whole keyboard example app is about 29 KB of flash and 4 KB of static RAM, plus a 3 KB worker thread stack.
@@ -151,6 +162,7 @@ For bring-up only, `BleHid.allowUnbonded(true)` runs without the patch and witho
 | `maxBonds(n)` (1–8, default 4), `evictOldestBond(bool)`, `autoPairWhenEmpty(bool)` | Bond policy. |
 | `battery(BatterySource::Auto / Manual / None)` | Battery service. Auto reads the fuel gauge. |
 | `readyDeadline(ms)` | How long input waits for a host before it's dropped (default 2000). |
+| `statusLed(StatusLed::Rgb / StatusLed::None)`, `statusLed(pin)` | Where Bluetooth status shows: RGB LED overlays (default), a plain LED, or nowhere. |
 | `installPatch(bool)` | Install the bundled patched system part when it's missing (default on). |
 
 At runtime:

@@ -5,6 +5,7 @@
 #include "bonds.h"
 #include "os_install.h"
 #include "platform.h"
+#include "status_light.h"
 
 #if defined(PARTICLE)
 #include "Particle.h" // defines HAL_PLATFORM_NRF52840
@@ -46,6 +47,7 @@ constexpr uint32_t kStoreRetryMs = 1000;
 constexpr uint32_t kScRetryMs = 500;
 constexpr uint8_t kScMaxTries = 10;
 constexpr const char* kBondDir = "/usr/phid";
+constexpr uint16_t kNoPin = 0xFFFF;
 
 enum class Ev : uint8_t {
     Connected,
@@ -122,6 +124,8 @@ struct Config {
     uint32_t readyDeadline = 2000;
     bool allowUnbonded = false;
     bool installPatch = true;
+    bool ledRgb = true;
+    uint16_t ledPin = kNoPin;
 };
 
 bool sdAes(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
@@ -255,6 +259,13 @@ struct BleHidImpl {
     bool suspended = false;
     void (*statusCallback)(const HidStatus&) = nullptr;
     HidStatus lastReported;
+    StatusLight light;
+    StatusLight::Output lightOut;
+    // Above the network and cloud status, below listening mode and updates.
+    LEDStatus ledOverlay{RGB_COLOR_BLUE, LED_PRIORITY_IMPORTANT};
+    // The LED config begin() started with; statusLed() changes apply at the next begin().
+    bool ledRgb = false;
+    uint16_t ledPin = kNoPin;
 
     // GATT value storage (VLOC_USER: the SoftDevice reads and writes these in place).
     uint8_t inputBuf[kMaxDevices][kMaxReport] = {};
@@ -963,6 +974,34 @@ struct BleHidImpl {
         (void)now;
     }
 
+    void showStatusLight(uint32_t now, const HidStatus& s) {
+        if (!ledRgb && ledPin == kNoPin) {
+            return;
+        }
+        uint32_t bonded, failed;
+        {
+            platform::Guard g;
+            bonded = stats.newBonds;
+            failed = stats.securityFailures + stats.pairingRejected;
+        }
+        setStatusLight(light.update(now, s, bonded, failed));
+    }
+
+    void setStatusLight(const StatusLight::Output& o) {
+        if (o == lightOut) {
+            return;
+        }
+        lightOut = o;
+        if (ledPin != kNoPin) {
+            digitalWrite(ledPin, o.show && o.rgb ? HIGH : LOW);
+        } else if (ledRgb && o.show) {
+            ledOverlay.setColor(o.rgb);
+            ledOverlay.setActive(true);
+        } else {
+            ledOverlay.setActive(false);
+        }
+    }
+
     // Without the PHID ABI the library gets no BLE events; find the peripheral link by polling.
     void pollLinkUnpatched(uint32_t now) {
         if (patched || now - lastLinkPoll < 250) {
@@ -1072,6 +1111,7 @@ struct BleHidImpl {
                 lastReported = s;
                 statusCallback(s);
             }
+            showStatusLight(now, s);
         }
         exited = true;
     }
@@ -1278,6 +1318,14 @@ struct BleHidImpl {
             error = HidReason::None;
             pairingOpen = pairingForever = cfg.autoPair && bonds.count() == 0;
         }
+        ledRgb = cfg.ledRgb;
+        ledPin = cfg.ledPin;
+        light = StatusLight(ledPin != kNoPin);
+        lightOut = StatusLight::Output();
+        if (ledPin != kNoPin) {
+            pinMode(ledPin, OUTPUT);
+            digitalWrite(ledPin, LOW);
+        }
         transport.impl = this;
         stopping = false;
         exited = false;
@@ -1327,6 +1375,12 @@ struct BleHidImpl {
             status = HidStatus();
         }
         persist(platform::millis() + kStoreRetryMs);
+        ledOverlay.setActive(false);
+        if (ledPin != kNoPin) {
+            digitalWrite(ledPin, LOW);
+        }
+        ledRgb = false;
+        ledPin = kNoPin; // a worker still finishing up can't turn it back on
         started = false;
     }
 };
@@ -1390,6 +1444,16 @@ BleHidClass& BleHidClass::battery(BatterySource s) {
 }
 BleHidClass& BleHidClass::readyDeadline(uint32_t ms) {
     g_impl.cfg.readyDeadline = ms;
+    return *this;
+}
+BleHidClass& BleHidClass::statusLed(StatusLed mode) {
+    g_impl.cfg.ledRgb = mode == StatusLed::Rgb;
+    g_impl.cfg.ledPin = kNoPin;
+    return *this;
+}
+BleHidClass& BleHidClass::statusLed(uint16_t pin) {
+    g_impl.cfg.ledRgb = false;
+    g_impl.cfg.ledPin = pin;
     return *this;
 }
 BleHidClass& BleHidClass::installPatch(bool on) {
@@ -1524,6 +1588,8 @@ BleHidClass& BleHidClass::evictOldestBond(bool) { return *this; }
 BleHidClass& BleHidClass::autoPairWhenEmpty(bool) { return *this; }
 BleHidClass& BleHidClass::battery(BatterySource) { return *this; }
 BleHidClass& BleHidClass::readyDeadline(uint32_t) { return *this; }
+BleHidClass& BleHidClass::statusLed(StatusLed) { return *this; }
+BleHidClass& BleHidClass::statusLed(uint16_t) { return *this; }
 BleHidClass& BleHidClass::installPatch(bool) { return *this; }
 BleHidClass& BleHidClass::allowUnbonded(bool) { return *this; }
 int BleHidClass::begin() { return -120; /* SYSTEM_ERROR_NOT_SUPPORTED */ }
