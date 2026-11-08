@@ -24,6 +24,7 @@ enum class HidReason : uint8_t {
     GattFailed,           // the SoftDevice refused a service (attribute table full?)
     BleStackFailed,
     AlreadyStarted,
+    InstallingPatch,      // installing the bundled patched system part; the device resets shortly
 };
 
 enum class ConnectionPreset : uint8_t {
@@ -85,6 +86,10 @@ public:
     BleHidClass& autoPairWhenEmpty(bool on);          // open pairing while there are no bonds (default)
     BleHidClass& battery(BatterySource source);
     BleHidClass& readyDeadline(uint32_t ms);          // how long input waits for a host (default 2000)
+    // When the system part lacks the patch, begin() installs the patched
+    // system part bundled as an asset (assetOtaDir=lib/particle-hid/assets)
+    // and the device resets. Default on; does nothing without the asset.
+    BleHidClass& installPatch(bool on);
     // Development only: run on stock Device OS without bonding. Most hosts
     // will not keep the device; Linux usually works.
     BleHidClass& allowUnbonded(bool on);

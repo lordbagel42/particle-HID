@@ -108,10 +108,10 @@ void setup() {
     Particle.variable("hid", [] {
         const HidStatus s = BleHid.status();
         const BleHidStats st = BleHid.stats();
-        return String::format("{\"state\":%d,\"bond\":%d,\"sec\":%d,\"bonds\":%d,\"conn\":%lu,\"reconnects\":%lu,"
+        return String::format("{\"state\":%d,\"reason\":%d,\"bond\":%d,\"sec\":%d,\"bonds\":%d,\"conn\":%lu,\"reconnects\":%lu,"
                               "\"newBonds\":%lu,\"svcChanged\":%lu,\"scConfirmed\":%lu,\"scResult\":%lu,\"cccdWrites\":%lu,"
                               "\"sent\":%lu,\"led\":\"%s\"}",
-                (int)s.state, s.bond, s.security, s.bondCount, st.connections, st.bondedReconnects, st.newBonds,
+                (int)s.state, (int)s.reason, s.bond, s.security, s.bondCount, st.connections, st.bondedReconnects, st.newBonds,
                 st.serviceChanged, st.scConfirmed, st.scLastResult, st.cccdWrites, st.reports.sent, current);
     });
 

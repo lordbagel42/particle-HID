@@ -46,6 +46,7 @@ const char* reasonName(HidReason r) {
     switch (r) {
     case HidReason::None: return "none";
     case HidReason::NeedsPatchedDeviceOS: return "needs-patched-device-os";
+    case HidReason::InstallingPatch: return "installing-patch";
     case HidReason::UnsupportedPlatform: return "unsupported-platform";
     case HidReason::ProfileInvalid: return "profile-invalid";
     case HidReason::GattFailed: return "gatt-failed";

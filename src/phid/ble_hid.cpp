@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "bonds.h"
+#include "os_install.h"
 #include "platform.h"
 
 #if defined(PARTICLE)
@@ -120,6 +121,7 @@ struct Config {
     BatterySource battery = BatterySource::Auto;
     uint32_t readyDeadline = 2000;
     bool allowUnbonded = false;
+    bool installPatch = true;
 };
 
 bool sdAes(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
@@ -1204,6 +1206,12 @@ struct BleHidImpl {
         info.size = sizeof(info);
         patched = hal_ble_internal(PHID_OP_GET_INFO, &info, sizeof(info), nullptr) == 0 && info.abi_version >= 1 &&
                 (info.caps & kRequiredCaps) == kRequiredCaps;
+        if (patched) {
+            detail::patchedSystemPartRunning();
+        } else if (cfg.installPatch && detail::installPatchedSystemPart() > 0) {
+            error = HidReason::InstallingPatch;
+            return SYSTEM_ERROR_NOT_SUPPORTED;
+        }
         if (!patched && !cfg.allowUnbonded) {
             error = HidReason::NeedsPatchedDeviceOS;
             hidLog.error("This system part has no PHID ABI. Flash the patched system-part1 (see device-os/README.md) "
@@ -1384,6 +1392,10 @@ BleHidClass& BleHidClass::readyDeadline(uint32_t ms) {
     g_impl.cfg.readyDeadline = ms;
     return *this;
 }
+BleHidClass& BleHidClass::installPatch(bool on) {
+    g_impl.cfg.installPatch = on;
+    return *this;
+}
 BleHidClass& BleHidClass::allowUnbonded(bool on) {
     g_impl.cfg.allowUnbonded = on;
     return *this;
@@ -1512,6 +1524,7 @@ BleHidClass& BleHidClass::evictOldestBond(bool) { return *this; }
 BleHidClass& BleHidClass::autoPairWhenEmpty(bool) { return *this; }
 BleHidClass& BleHidClass::battery(BatterySource) { return *this; }
 BleHidClass& BleHidClass::readyDeadline(uint32_t) { return *this; }
+BleHidClass& BleHidClass::installPatch(bool) { return *this; }
 BleHidClass& BleHidClass::allowUnbonded(bool) { return *this; }
 int BleHidClass::begin() { return -120; /* SYSTEM_ERROR_NOT_SUPPORTED */ }
 void BleHidClass::end() {}

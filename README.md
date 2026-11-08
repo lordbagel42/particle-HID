@@ -23,7 +23,7 @@ void loop() {
 It has two parts:
 
 1. **This library**, which you add to your firmware. It owns the HID profile, the report queues, pairing, and the bond store.
-2. **A small Device OS patch** (+384 bytes), flashed once per device. Stock Device OS can't keep Bluetooth bonds, and HID needs them. See [`device-os/README.md`](device-os/README.md) for what the patch changes and how it was checked.
+2. **A small Device OS patch** (+384 bytes). Stock Device OS can't keep Bluetooth bonds, and HID needs them. The library ships the patched system part and installs it on the device's first boot, so you don't flash it separately. See [`device-os/README.md`](device-os/README.md) for what the patch changes and how it was checked.
 
 ## Tested
 
@@ -32,25 +32,14 @@ On a Boron BRN404X running the patched 6.6.0 system part, with macOS:
 - Paired once, then typed text from a cloud function call. All 106 reports for 48 characters arrived, with no disconnects.
 - Reconnected without a pairing prompt after the Mac's Bluetooth was toggled (140 ms from connect to ready), and after the Boron rebooted twice (152 and 192 ms).
 - Caps Lock LED reports reached the device from the host.
+- Self-install: with stock 6.6.0 on the Boron, the bundled patch installed and applied on the first boot (twice, from two separate stock restores), and bonds were back afterwards. A deliberately corrupted asset failed validation without a reset, was tried twice across reboots, and then left alone.
 - Adding a custom BLE service changed the attribute table. The Mac confirmed Service Changed, rediscovered, and kept typing on the same bond.
 
 Not yet tested: Windows, iOS, Android, Linux, the mouse and gamepad on hardware, listening mode, and long soaks.
 
 ## Use it in your firmware
 
-### 1. Put the patched system part on the device (once)
-
-Download `boron-system-part1@6.6.0+phid.1.bin` and its `.sha256` from the [latest release](https://github.com/lordbagel42/particle-hid/releases/latest). The device needs Device OS 6.6.0 first:
-
-```sh
-sha256sum -c boron-system-part1@6.6.0+phid.1.bin.sha256
-particle update                                          # skip if the device already runs 6.6.0
-particle flash --usb boron-system-part1@6.6.0+phid.1.bin
-```
-
-To flash over the cloud instead, or to go back to stock, see [`device-os/README.md`](device-os/README.md#install-it-on-a-device).
-
-### 2. Add the library to your project
+### 1. Add the library to your project
 
 In a Particle project (the layout `particle project create` and Workbench use), put the library under `lib/`. A git submodule keeps it updatable:
 
@@ -63,10 +52,24 @@ git submodule add https://github.com/lordbagel42/particle-hid.git lib/particle-h
 my-project/
   project.properties
   src/my-project.cpp
-  lib/particle-hid/      <- library.properties, src/, ...
+  lib/particle-hid/      <- library.properties, src/, assets/, ...
 ```
 
 Workbench, `particle compile`, and local builds pick up `lib/*/src` automatically. Don't also list `particle-hid` under `dependencies` in `project.properties`: it isn't in the Particle library registry.
+
+### 2. Bundle the Device OS patch
+
+Add one line to `project.properties`:
+
+```properties
+assetOtaDir=lib/particle-hid/assets
+```
+
+That ships the patched system part with your firmware as an [Asset OTA](https://docs.particle.io/reference/asset-ota/asset-ota/) asset. When `BleHid.begin()` finds stock Device OS 6.6.0 and the bundled patch, it installs the patch and the device resets once. Nothing else to flash, whether you flash one device or release to a product fleet.
+
+The bundled patch is for the **Boron** only. On other nRF52840 platforms, leave `assetOtaDir` out (the asset would only take up asset storage) and flash a patch built for that platform by hand. Devices with Device Protection can't install it from the app.
+
+If your project already has an `assetOtaDir`, copy `lib/particle-hid/assets/boron-system-part1@6.6.0+phid.1.bin` into it instead. The library looks for an asset whose name contains `+phid` and ends in `.bin`.
 
 ### 3. Use it
 
@@ -94,12 +97,26 @@ Key names, media keys, and buttons live in the `phid` namespace (`phid::Key::A`,
 
 ### 4. Build and flash it for 6.6.0
 
+With assets, `particle compile` writes a `.zip` (your app plus the patch). Flash or upload that:
+
 ```sh
-particle compile boron . --target 6.6.0 --saveTo firmware.bin
-particle flash --usb firmware.bin                         # or: particle flash <device> firmware.bin
+particle compile boron . --target 6.6.0 --saveTo firmware.zip
+particle flash <device> firmware.zip      # or upload firmware.zip as product firmware in the console
 ```
 
 Always build for **6.6.0**. The patch is a 6.6.0 system part, and firmware built for a newer Device OS makes the cloud replace it with stock.
+
+On a device that isn't patched yet, the first boot goes like this:
+
+1. The cloud flashes the app, then the device downloads the asset in safe mode (breathing magenta).
+2. The app starts. `BleHid.begin()` copies the patch into the OTA area (about 13 s on a Boron, LED blinking magenta), checks its integrity and dependencies, and returns `SYSTEM_ERROR_NOT_SUPPORTED` with `status().reason == HidReason::InstallingPatch`.
+3. Device OS resets and applies it. From then on `begin()` starts HID normally, and later app updates with the same asset don't download or install it again.
+
+The install only runs when the asset replaces the running system part of the same platform and version (6.6.0), so it never downgrades or crosses Device OS versions. A patch that fails its checks is discarded without a reset. Each asset gets at most two attempts, and at most one per boot, so a bad one can't put the device in a loop; pressing RESET or power-cycling allows one more. `BleHid.installPatch(false)` turns it off.
+
+It only installs onto stock Device OS. A device that already runs a patched system part keeps it, even if a later library release bundles a newer one.
+
+To flash the patch by hand instead (USB, or without assets), see [`device-os/README.md`](device-os/README.md#install-it-on-a-device).
 
 ### 5. Pair
 
@@ -107,7 +124,7 @@ With no bonds, the device opens pairing on its own and advertises under your nam
 
 ## How it fits with the rest of your firmware
 
-- **Nothing blocks.** `begin()` returns at once, and input calls (`tap`, `print`, `move`, ...) only queue. A worker thread sends the reports. Call them from `loop()` or any application thread, not from an ISR.
+- **Nothing blocks.** `begin()` returns at once (except for the one-time patch install above, about 13 s), and input calls (`tap`, `print`, `move`, ...) only queue. A worker thread sends the reports. Call them from `loop()` or any application thread, not from an ISR.
 - **It coexists with cellular and the cloud.** On the Boron, `Particle.publish`, functions, and OTA keep working while HID is connected; the bring-up example uses all of them.
 - **USB HID stays available.** The classes are prefixed `BT` so Device OS's own USB `Keyboard` and `Mouse` still work in the same app.
 - **Your own BLE services work too.** Use Device OS's normal `BLE` API next to `BleHid`, over the same bonded connection. Add your characteristics **after** `BleHid.begin()`, so adding or changing them later doesn't move the HID attributes. When the attribute table changes, bonded hosts get Service Changed and rediscover it. [`examples/haven-badge`](examples/haven-badge/haven-badge.cpp) adds an LED characteristic, and [`tools/badge-led`](tools/badge-led/badge-led.swift) is a macOS CLI that sets it over the existing connection.
@@ -117,7 +134,7 @@ With no bonds, the device opens pairing on its own and advertises under your nam
 
 ### On stock Device OS
 
-The library never half-works. On a system part without the patch, `begin()` returns `SYSTEM_ERROR_NOT_SUPPORTED`, and `status().reason` is `HidReason::NeedsPatchedDeviceOS`. The rest of your app keeps running, so firmware with `particle-hid` can safely reach devices that aren't patched yet.
+The library never half-works. On a system part without the patch and no bundled patch to install, `begin()` returns `SYSTEM_ERROR_NOT_SUPPORTED`, and `status().reason` is `HidReason::NeedsPatchedDeviceOS`. The rest of your app keeps running, so firmware with `particle-hid` can safely reach devices that aren't patched yet.
 
 For bring-up only, `BleHid.allowUnbonded(true)` runs without the patch and without bonding. Linux usually accepts that; other hosts usually don't, and LED and Protocol Mode writes aren't seen.
 
@@ -134,6 +151,7 @@ For bring-up only, `BleHid.allowUnbonded(true)` runs without the patch and witho
 | `maxBonds(n)` (1–8, default 4), `evictOldestBond(bool)`, `autoPairWhenEmpty(bool)` | Bond policy. |
 | `battery(BatterySource::Auto / Manual / None)` | Battery service. Auto reads the fuel gauge. |
 | `readyDeadline(ms)` | How long input waits for a host before it's dropped (default 2000). |
+| `installPatch(bool)` | Install the bundled patched system part when it's missing (default on). |
 
 At runtime:
 
@@ -177,12 +195,13 @@ Callbacks (`onStatus`, `onLeds`) run on the HID worker thread. Keep them short, 
 | [`cloud-bringup`](examples/cloud-bringup/cloud-bringup.cpp) | Keyboard driven and observed over the Particle cloud, for remote testing |
 | [`haven-badge`](examples/haven-badge/haven-badge.cpp) | Keyboard plus a custom LED service, used with `tools/badge-led` |
 
-Build one with `particle compile boron examples/keyboard --target 6.6.0`.
+Build one with `particle compile boron examples/keyboard --target 6.6.0`. The examples don't bundle the patch, so flash it by hand first or copy an example into a project with `assetOtaDir` set.
 
 ## Repository
 
 ```text
 src/                  the library
+assets/               the patched system part, bundled into apps as an Asset OTA asset
 examples/             example apps
 device-os/            the Device OS patch, build script, and binary comparison
 scripts/              flash-usb.sh and flash-cloud.sh (Boron)

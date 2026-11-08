@@ -3,7 +3,7 @@
 `particle-hid` needs one change to Device OS: a small hook in the nRF52840 BLE HAL that lets user firmware handle bonding. Stock Device OS never stores pairing keys, never answers a returning host's encryption request, and forgets subscriptions, so hosts treat a HID device as new every time, or drop it.
 
 - **Source:** [`lordbagel42/device-os`, branch `phid/v6.6.0`](https://github.com/lordbagel42/device-os/tree/phid/v6.6.0). It is one commit on top of `v6.6.0`. The same commit is in [`patches/`](patches/) as a `git am` patch.
-- **Binary:** `boron-system-part1@6.6.0+phid.1.bin`, attached to each [particle-hid release](https://github.com/lordbagel42/particle-hid/releases). Check it against the `.sha256` file next to it.
+- **Binary:** `boron-system-part1@6.6.0+phid.1.bin`, in the library's [`assets/`](../assets) and attached to each [particle-hid release](https://github.com/lordbagel42/particle-hid/releases). Check it against the `.sha256` file next to the release copy.
 - **License:** the patch is part of Device OS and is LGPL-3.0, like the rest of Device OS.
 
 ## What it changes
@@ -26,7 +26,11 @@ The full contract is in [`ble_hal_phid.h`](../src/phid/ble_hal_phid.h).
 
 ## Install it on a device
 
-The device must already run Device OS **6.6.0**, including its bootloader. Check with `particle usb list` or `scripts/flash-cloud.sh check <device>`.
+**With the library** (recommended): add `assetOtaDir=lib/particle-hid/assets` to your project's `project.properties`. `BleHid.begin()` then installs the bundled patch on a stock 6.6.0 device and the device resets once. See the [main README](../README.md#2-bundle-the-device-os-patch).
+
+It uses the update API Device OS exports to apps (`Spark_Prepare_For_Firmware_Update`, `Spark_Save_Firmware_Chunk`, `Spark_Finish_Firmware_Update`), the same API a USB update uses. It writes the image to the OTA area, runs Device OS's integrity and dependency checks without applying it, then applies it, and the bootloader installs it on the next boot. It only runs when the asset matches the running system part's platform, index, start address, and version, and an attempt count in `/usr/phid/os-install` limits each asset to two tries. It fails with an error, logged under the `hid` category, on devices with Device Protection or with updates disabled.
+
+**By hand.** The device must already run Device OS **6.6.0**, including its bootloader. Check with `particle usb list` or `scripts/flash-cloud.sh check <device>`.
 
 **Over USB** (recommended for the first device):
 
@@ -46,12 +50,12 @@ scripts/flash-cloud.sh system <device>                  # then the patched syste
 
 A product device must be marked as a development device first (`scripts/flash-cloud.sh dev <device>`). Otherwise the product's fleet updates replace the test firmware.
 
-**Back to stock:** `scripts/flash-usb.sh restore` or `scripts/flash-cloud.sh restore <device>`. Both download Particle's official 6.6.0 system part and check its SHA-256 before flashing.
+**Back to stock:** `scripts/flash-usb.sh restore` or `scripts/flash-cloud.sh restore <device>`. Both download Particle's official 6.6.0 system part and check its SHA-256 before flashing. If the app on the device bundles the patch, it installs it again on the next boot, so flash an app without the asset, or one that calls `BleHid.installPatch(false)`, first.
 
 **Things to know:**
 
 - Gen 3 devices have no system-part rollback. If a system part faults at boot, only USB can recover the device, so keep one within reach of a cable the first time.
-- Anything that sends the device a stock system part replaces the patch, for example `particle update` or a product's Device OS target. `BleHid.status().reason` then reports `NeedsPatchedDeviceOS`. Bonds stay on flash, so re-flashing the patched part restores them.
+- Anything that sends the device a stock system part replaces the patch, for example `particle update` or a product's Device OS target. With the bundled asset, the next boot on 6.6.0 installs the patch again. Without it, `BleHid.status().reason` reports `NeedsPatchedDeviceOS`. Bonds stay on flash either way, so they're back once the patch is.
 
 ## Build it yourself
 
@@ -73,4 +77,4 @@ The script compares every function with layout shifts masked out, and every dyna
 
 ## Porting to another Device OS version
 
-Rebase the commit onto the new tag, rebuild, and run `compare-to-stock.py` against a stock build of the same tag. Then update `TAG` in `build.sh` and the version checks in the `scripts/` flash scripts. The library checks the ABI version and capabilities at runtime, not the Device OS version.
+Rebase the commit onto the new tag, rebuild, and run `compare-to-stock.py` against a stock build of the same tag. Then update `TAG` in `build.sh`, the version checks in the `scripts/` flash scripts, and the binary in `assets/` (the self-install only replaces a system part of the same version). The library checks the ABI version and capabilities at runtime, not the Device OS version.
