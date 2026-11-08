@@ -120,7 +120,11 @@ To flash the patch by hand instead (USB, or without assets), see [`device-os/REA
 
 ### 5. Pair
 
-With no bonds, the device opens pairing on its own and advertises under your name. Pair it from the computer's Bluetooth settings; there is no PIN. To pair another host later, call `BleHid.startPairing()`, for example from a button held at boot (see [`examples/keyboard`](examples/keyboard/keyboard.cpp)).
+With no bonds, the device opens pairing on its own and advertises under your name. Pair it from the computer's Bluetooth settings; there is no PIN.
+
+To pair another host later, or to pair again after removing the device on the computer, call `BleHid.startPairing()`, for example from a button held at boot (see [`examples/keyboard`](examples/keyboard/keyboard.cpp)). The device holds one connection at a time, so a host that's still connected (or reconnects) keeps it; turn Bluetooth off on that host while you pair a new one.
+
+Outside pairing mode the device is invisible to new hosts: it advertises only to bonded hosts (a SoftDevice whitelist, which also resolves their private addresses), isn't discoverable, and ignores connection and scan requests from anyone else. With no bonds and pairing closed, it doesn't advertise at all.
 
 ## How it fits with the rest of your firmware
 
@@ -193,7 +197,7 @@ Callbacks (`onStatus`, `onLeds`) run on the HID worker thread. Keep them short, 
 - **Nothing is dropped silently.** Input waits up to `readyDeadline` for a host, then is dropped and counted in `stats()`. Held keys and buttons stay held across a disconnect and are restated when the host is back.
 - **Mouse motion is never lost or duplicated.** Moves are summed and sent in clamped chunks, and a click lands after the motion before it.
 - **A gamepad tap shorter than a connection interval still registers.**
-- **Pairing is gated.** Hosts can pair only inside the pairing window, which opens automatically while there are no bonds.
+- **Pairing is gated.** Hosts can pair only inside the pairing window, which opens automatically while there are no bonds. Outside it, only bonded hosts can connect.
 - **Bond writes are atomic** (tmp file + rename), and a corrupt record is discarded, never fatal.
 - **Profile changes are safe.** Each bond stores a hash of the attribute table. When a firmware update changes it, returning hosts get Service Changed, and the bond only takes the new hash once the host confirms.
 

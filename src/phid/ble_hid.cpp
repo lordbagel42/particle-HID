@@ -253,6 +253,14 @@ struct BleHidImpl {
     bool advDirty = true;
     bool advDiscoverable = false;
     uint32_t lastAdvCheck = 0;
+    // Who may connect: nobody, bonded hosts only (whitelist), or anyone (pairing).
+    enum class Access : uint8_t { Off, Bonded, Open };
+    Access advAccess = Access::Off;
+    hal_ble_adv_fp_t advFilter = BLE_ADV_FP_ANY;
+    uint32_t advIds = 0; // bondIdentities() the whitelist was built from
+    uint32_t advAccessFailedAt = 0;
+    bool advAccessFailed = false;
+    bool listeningRestarted = false;
     uint32_t lastBattery = 0;
     uint32_t lastStoreAttempt = 0;
     uint32_t lastLinkPoll = 0;
@@ -872,7 +880,7 @@ struct BleHidImpl {
         advDiscoverable = discoverable;
     }
 
-    void setAdvInterval(int phase) {
+    int setAdvInterval(int phase) {
         // Apple's accessory guidelines: 20 ms for 30 s, then 152.5 ms, then 1022.5 ms.
         static const uint16_t kIntervals[3] = {32, 244, 1636};
         hal_ble_adv_params_t p = {};
@@ -882,44 +890,195 @@ struct BleHidImpl {
         p.interval = kIntervals[phase];
         p.timeout = 0;
         p.type = BLE_ADV_CONNECTABLE_SCANNABLE_UNDIRECRED_EVT;
-        p.filter_policy = BLE_ADV_FP_ANY;
-        hal_ble_gap_set_advertising_parameters(&p, nullptr);
-        advPhase = phase;
+        p.filter_policy = advFilter;
+        const int r = hal_ble_gap_set_advertising_parameters(&p, nullptr);
+        advPhase = phase; // even on failure: retrying every loop wouldn't help
+        if (r != 0) {
+            hidLog.error("advertising parameters: %d", r);
+        }
+        return r;
+    }
+
+    // Only identity addresses can be whitelisted. A host that bonded without
+    // sending one can reconnect only while pairing is open.
+    static bool whitelistable(const Bond& b) {
+        return b.used && (b.addrType == AddrType::Public || b.addrType == AddrType::RandomStatic);
+    }
+
+    // Fingerprint of the whitelistable bonds; 0 when there are none. Call under the lock.
+    uint32_t bondIdentities() const {
+        uint32_t crc = 0;
+        size_t n = 0;
+        for (size_t i = 0; i < bonds.capacity(); ++i) {
+            const Bond& b = bonds.slot(i);
+            if (whitelistable(b)) {
+                crc = crc32(&b.addrType, 1, crc);
+                crc = crc32(b.addr, 6, crc);
+                crc = crc32(b.irk, b.hasIrk ? 16 : 0, crc);
+                ++n;
+            }
+        }
+        return n ? (crc | 1) : 0;
+    }
+
+    // Loads the bonded hosts into the SoftDevice's identity list (so their private
+    // addresses resolve) and whitelist. Advertising must be stopped.
+    int setWhitelist() {
+        ble_gap_id_key_t keys[BondTable::kMaxBonds];
+        const ble_gap_id_key_t* keyPtrs[BondTable::kMaxBonds];
+        const ble_gap_addr_t* addrPtrs[BondTable::kMaxBonds];
+        uint8_t n = 0;
+        {
+            platform::Guard g;
+            for (size_t i = 0; i < bonds.capacity(); ++i) {
+                const Bond& b = bonds.slot(i);
+                bool dup = false;
+                for (uint8_t j = 0; j < n && !dup; ++j) {
+                    dup = keys[j].id_addr_info.addr_type == b.addrType && !memcmp(keys[j].id_addr_info.addr, b.addr, 6);
+                }
+                // The SoftDevice refuses the whole list if an identity appears twice
+                // (possible after maxBonds shrinks and grows again).
+                if (!whitelistable(b) || dup) {
+                    continue;
+                }
+                keys[n] = {};
+                if (b.hasIrk) {
+                    memcpy(keys[n].id_info.irk, b.irk, 16);
+                }
+                keys[n].id_addr_info.addr_id_peer = 1;
+                keys[n].id_addr_info.addr_type = b.addrType;
+                memcpy(keys[n].id_addr_info.addr, b.addr, 6);
+                keyPtrs[n] = &keys[n];
+                addrPtrs[n] = &keys[n].id_addr_info;
+                ++n;
+            }
+        }
+        if (n == 0) {
+            return SYSTEM_ERROR_NOT_FOUND;
+        }
+        uint32_t r = sd_ble_gap_device_identities_set(keyPtrs, nullptr, n);
+        if (r == NRF_SUCCESS) {
+            r = sd_ble_gap_whitelist_set(addrPtrs, n);
+        }
+        if (r != NRF_SUCCESS) {
+            hidLog.error("whitelist: 0x%lx", (unsigned long)r);
+            return SYSTEM_ERROR_INTERNAL;
+        }
+        return 0;
+    }
+
+    void clearWhitelist() {
+        sd_ble_gap_whitelist_set(nullptr, 0);
+        sd_ble_gap_device_identities_set(nullptr, nullptr, 0);
+    }
+
+    // Outside pairing, only bonded hosts can connect or even get a scan response;
+    // with no bonds and pairing closed, the device doesn't advertise at all.
+    void applyAccess(Access want, int phase) {
+        hal_ble_gap_stop_advertising(nullptr);
+        if (want == Access::Bonded && setWhitelist() != 0) {
+            want = Access::Off; // fail closed; retried after kAdvCheckMs
+            advAccessFailed = true;
+            advAccessFailedAt = platform::millis();
+        } else {
+            advAccessFailed = false;
+        }
+        // The SoftDevice refuses discoverable flags with a whitelist, so the data
+        // goes first when filtering and last when opening up.
+        const hal_ble_adv_fp_t filter = want == Access::Bonded ? BLE_ADV_FP_FILTER_BOTH : BLE_ADV_FP_ANY;
+        if (want != Access::Open) {
+            applyAdvertising(false);
+        }
+        advFilter = filter;
+        if (setAdvInterval(phase) != 0 && want == Access::Bonded) {
+            want = Access::Off; // never fall back to unfiltered advertising
+            advAccessFailed = true;
+            advAccessFailedAt = platform::millis();
+        }
+        if (want == Access::Open) {
+            applyAdvertising(true);
+        }
+        advAccess = want;
+        if (want != Access::Off) {
+            hal_ble_gap_start_advertising(nullptr);
+        }
+    }
+
+    // Without the patch there are no bonds to filter on; stay open.
+    Access wantedAccess(bool pairing, uint32_t ids) const {
+        return pairing || !patched ? Access::Open : ids ? Access::Bonded : Access::Off;
     }
 
     void manageAdvertising(uint32_t now, bool connected, bool restart, bool pairing) {
-        if (connected) {
-            return;
-        }
         if (Network.listening()) {
+            // Provisioning sets discoverable data before its own parameters, which the
+            // SoftDevice refuses while our whitelist filter is on, and then gives up.
+            // Drop the filter and restart listening mode once so it can advertise.
+            hal_ble_adv_params_t p = {};
+            p.version = BLE_API_VERSION;
+            p.size = sizeof(p);
+            hal_ble_gap_get_advertising_parameters(&p, nullptr);
+            if (p.filter_policy != BLE_ADV_FP_ANY && !listeningRestarted) {
+                listeningRestarted = true;
+                hidLog.warn("restarting listening mode without the bonded-host filter");
+                hal_ble_gap_stop_advertising(nullptr);
+                advFilter = BLE_ADV_FP_ANY;
+                setAdvInterval(0);
+                Network.listen(false);
+                Network.listen(true);
+            }
             advDirty = true; // provisioning owns advertising; take it back afterwards
             advPhase = -1;
             return;
         }
+        listeningRestarted = false;
+        if (connected) {
+            return;
+        }
         if (restart) {
             advStartedAt = now;
+            advDirty = true;
         }
-        if (advDirty || pairing != advDiscoverable) {
-            applyAdvertising(pairing);
-            advDirty = false;
+        uint32_t ids;
+        {
+            platform::Guard g;
+            ids = bondIdentities();
         }
+        const Access want = wantedAccess(pairing, ids);
         const uint32_t age = now - advStartedAt;
         const int phase = age < 30000 ? 0 : age < 300000 ? 1 : 2;
-        if (phase != advPhase) {
+        const bool retry = advAccessFailed && now - advAccessFailedAt >= kAdvCheckMs;
+        if (advDirty || retry || want != (advAccessFailed ? Access::Bonded : advAccess) ||
+                (want == Access::Bonded && ids != advIds)) {
+            applyAccess(want, phase);
+            advIds = ids;
+            advDirty = false;
+        } else if (phase != advPhase) {
             setAdvInterval(phase);
         }
         if (now - lastAdvCheck >= kAdvCheckMs) {
             lastAdvCheck = now;
             // Someone else (listening mode, user code) may have replaced our data or stopped advertising.
-            uint8_t want[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
+            uint8_t mine[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
             uint8_t have[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
-            const size_t w = advData(want, advDiscoverable);
+            const size_t w = advData(mine, advDiscoverable);
             const ssize_t h = hal_ble_gap_get_advertising_data(have, sizeof(have), nullptr);
-            if (h != (ssize_t)w || memcmp(want, have, w) != 0) {
+            if (h != (ssize_t)w || memcmp(mine, have, w) != 0) {
                 applyAdvertising(advDiscoverable);
             }
-            if (!hal_ble_gap_is_advertising(nullptr)) {
+            // App code may have replaced the parameters, filter included.
+            hal_ble_adv_params_t p = {};
+            p.version = BLE_API_VERSION;
+            p.size = sizeof(p);
+            hal_ble_gap_get_advertising_parameters(&p, nullptr);
+            if (p.filter_policy != advFilter) {
+                advDirty = true; // re-applied on the next pass
+            }
+            const bool on = hal_ble_gap_is_advertising(nullptr);
+            if (advAccess != Access::Off && !on) {
                 hal_ble_gap_start_advertising(nullptr);
+            } else if (advAccess == Access::Off && on) {
+                hal_ble_gap_stop_advertising(nullptr);
             }
         }
     }
@@ -1329,13 +1488,16 @@ struct BleHidImpl {
         transport.impl = this;
         stopping = false;
         exited = false;
-        advDirty = true;
         advPhase = -1;
         advStartedAt = platform::millis();
-        hal_ble_gap_set_auto_advertise(BLE_AUTO_ADV_ALWAYS, nullptr);
-        applyAdvertising(pairingOpen);
-        setAdvInterval(0);
-        hal_ble_gap_start_advertising(nullptr);
+        // The worker restarts advertising after a disconnect, with the right whitelist.
+        hal_ble_gap_set_auto_advertise(BLE_AUTO_ADV_FORBIDDEN, nullptr);
+        {
+            platform::Guard g;
+            advIds = bondIdentities();
+        }
+        applyAccess(wantedAccess(pairingOpen, advIds), 0);
+        advDirty = false;
         if (os_thread_create(&thread, "hid", OS_THREAD_PRIORITY_DEFAULT + 1, &BleHidImpl::workerMain, this, 3072) != 0) {
             return SYSTEM_ERROR_NO_MEMORY;
         }
@@ -1362,6 +1524,10 @@ struct BleHidImpl {
         }
         hal_ble_gap_set_auto_advertise(BLE_AUTO_ADV_FORBIDDEN, nullptr);
         hal_ble_gap_stop_advertising(nullptr);
+        advFilter = BLE_ADV_FP_ANY;
+        advAccess = Access::Off;
+        setAdvInterval(advPhase >= 0 ? advPhase : 0); // leave unfiltered parameters for the app's own advertising
+        clearWhitelist();
         {
             platform::Guard g;
             if (link.conn != kInvalidConn) {
