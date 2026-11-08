@@ -1,0 +1,4 @@
+.build/
+dist/
+test/native/build/
+tools/badge-led/badge-led
