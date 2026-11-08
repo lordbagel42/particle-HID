@@ -1,0 +1,283 @@
+From a2ca5e3e38dc28cdbec44e2a161d0a207337396e Mon Sep 17 00:00:00 2001
+From: Raygen Rupe <raygenrrupe@gmail.com>
+Date: Sun, 8 Nov 2026 00:33:17 +0000
+Subject: [PATCH] feat(ble): add security delegate for user-owned bonding on
+ nRF52840
+
+Adds hal_ble_internal ops PHID_OP_GET_INFO and PHID_OP_SET_DELEGATE. With a delegate installed, user firmware chooses bonding and key storage on SEC_PARAMS_REQUEST, answers SEC_INFO_REQUEST and SYS_ATTR_MISSING, sees every BLE thread event including SC_CONFIRM, and gets a wake semaphore on HVN_TX_COMPLETE. Without a delegate behavior is unchanged.
+
+Co-authored-by: Amp <amp@ampcode.com>
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1aca9-1c41-7744-a5cd-a33e37046aac
+---
+ hal/inc/ble_hal_phid.h       | 86 +++++++++++++++++++++++++++++++
+ hal/src/nRF52840/ble_hal.cpp | 98 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 184 insertions(+)
+ create mode 100644 hal/inc/ble_hal_phid.h
+
+diff --git a/hal/inc/ble_hal_phid.h b/hal/inc/ble_hal_phid.h
+new file mode 100644
+index 0000000..8d71066
+--- /dev/null
++++ b/hal/inc/ble_hal_phid.h
+@@ -0,0 +1,86 @@
++/*
++ * BLE security delegate extension ("PHID ABI") for nRF52840 Device OS.
++ *
++ * Lets user firmware own bonding: it decides whether to bond and where the
++ * exchanged keys go, answers LTK requests from returning hosts, and restores
++ * per-host system attributes (CCCDs). Without a delegate the HAL behaves
++ * exactly like stock Device OS.
++ *
++ * All calls go through hal_ble_internal(op, data, size, nullptr). Stock
++ * Device OS returns SYSTEM_ERROR_NOT_SUPPORTED, which is how callers detect
++ * the extension.
++ *
++ * Keep this file identical to particle-hid's src/phid/ble_hal_phid.h.
++ */
++
++#ifndef BLE_HAL_PHID_H
++#define BLE_HAL_PHID_H
++
++#include <stdint.h>
++
++#define PHID_ABI_VERSION 1
++
++#define PHID_OP_GET_INFO     0x50480001
++#define PHID_OP_SET_DELEGATE 0x50480002
++
++#define PHID_CAP_SEC_DELEGATE      (1u << 0) // SEC_PARAMS hook and consumable SEC_INFO_REQUEST
++#define PHID_CAP_SYS_ATTR_DELEGATE (1u << 1) // consumable BLE_GATTS_EVT_SYS_ATTR_MISSING
++#define PHID_CAP_TX_WAKE           (1u << 2) // wake semaphore given on BLE_GATTS_EVT_HVN_TX_COMPLETE
++#define PHID_CAP_SC_CONFIRM        (1u << 3) // BLE_GATTS_EVT_SC_CONFIRM delivered to the delegate
++
++typedef struct phid_info_t {
++    uint16_t version;
++    uint16_t size;
++    uint32_t abi_version;
++    uint32_t caps;
++} phid_info_t;
++
++// Delegate operations.
++#define PHID_DELEGATE_EVENT      1 // data: const ble_evt_t*
++#define PHID_DELEGATE_SEC_PARAMS 2 // data: phid_sec_params_t*
++
++/*
++ * PHID_DELEGATE_SEC_PARAMS is called on the BLE event thread right before the
++ * HAL replies to BLE_GAP_EVT_SEC_PARAMS_REQUEST on a peripheral link. The
++ * delegate sets reject or bond. When bond is set, the key pointers must stay
++ * valid until BLE_GAP_EVT_AUTH_STATUS for this connection.
++ */
++typedef struct phid_sec_params_t {
++    uint16_t version;
++    uint16_t size;
++    uint16_t conn_handle;
++    uint8_t reject;           // out: reply PAIRING_NOT_SUPP
++    uint8_t bond;             // out: request bonding and distribute keys
++    const void* peer_params;  // in: const ble_gap_sec_params_t*
++    void* own_enc;            // out: ble_gap_enc_key_t*
++    void* own_id;             // out: ble_gap_id_key_t* (normally NULL)
++    void* peer_enc;           // out: ble_gap_enc_key_t*
++    void* peer_id;            // out: ble_gap_id_key_t*
++} phid_sec_params_t;
++
++/*
++ * Called on the BLE event thread, never from an interrupt.
++ *
++ * PHID_DELEGATE_EVENT receives every event the HAL dispatches to its thread,
++ * for all roles. Two event types are consumable and are delivered before the
++ * HAL's default handling; return 1 when the delegate replied to them:
++ *   - BLE_GAP_EVT_SEC_INFO_REQUEST (default: no reply, as in stock Device OS)
++ *   - BLE_GATTS_EVT_SYS_ATTR_MISSING (default: empty system attributes)
++ * All other events are delivered after the HAL's handling; the return value
++ * is ignored.
++ *
++ * The callback must not block and must not call hal_ble_* functions, which
++ * take the BLE API lock that application threads may hold while they wait
++ * on this thread. Calling sd_* SoftDevice functions is allowed.
++ */
++typedef int (*phid_delegate_cb_t)(int op, void* data, void* context);
++
++typedef struct phid_delegate_t {
++    uint16_t version;
++    uint16_t size;
++    phid_delegate_cb_t callback; // NULL removes the delegate
++    void* context;
++    void* wake_semaphore;        // os_semaphore_t, optional; given on every HVN_TX_COMPLETE
++} phid_delegate_t;
++
++#endif // BLE_HAL_PHID_H
+diff --git a/hal/src/nRF52840/ble_hal.cpp b/hal/src/nRF52840/ble_hal.cpp
+index 0e2ab84..9a64e4c 100644
+--- a/hal/src/nRF52840/ble_hal.cpp
++++ b/hal/src/nRF52840/ble_hal.cpp
+@@ -58,6 +58,7 @@ LOG_SOURCE_CATEGORY("hal.ble");
+ #include "scope_guard.h"
+ 
+ #include "mbedtls/ecdh.h"
++#include "ble_hal_phid.h"
+ #include "mbedtls_util.h"
+ 
+ using namespace particle;
+@@ -94,10 +95,32 @@ using namespace particle::ble;
+ })
+ 
+ //anonymous namespace
++// Like BleEventDispatcher::enqueue(const ble_evt_t*), but reports allocation failure instead of asserting.
++static bool phidForward(const ble_evt_t* event);
++
+ namespace {
+ 
+ StaticRecursiveMutex s_bleMutex;
+ 
++// Security delegate installed through hal_ble_internal(PHID_OP_SET_DELEGATE).
++// Written under the BLE API lock; read on the BLE event thread and in SoftDevice
++// observers. The callback is written last on install and cleared first on removal.
++struct PhidDelegate {
++    volatile phid_delegate_cb_t callback;
++    void* volatile context;
++    volatile os_semaphore_t wake;
++};
++PhidDelegate s_phid = {};
++
++bool phidConsumable(uint16_t evtId) {
++    return evtId == BLE_GAP_EVT_SEC_INFO_REQUEST || evtId == BLE_GATTS_EVT_SYS_ATTR_MISSING;
++}
++
++int phidCall(int op, void* data) {
++    const phid_delegate_cb_t cb = s_phid.callback;
++    return cb ? cb(op, data, s_phid.context) : 0;
++}
++
+ bool bleInLockedMode = false;
+ 
+ constexpr auto BLE_CONN_CFG_TAG = 1;
+@@ -737,6 +760,17 @@ void BleObject::BleEventDispatcher::enqueue(ble_evt_t** event) {
+     }
+ }
+ 
++static bool phidForward(const ble_evt_t* event) {
++    auto dispatcher = BleObject::getInstance().dispatcher();
++    ble_evt_t* copy = (ble_evt_t*)dispatcher->allocEventData(sizeof(ble_evt_t));
++    if (!copy) {
++        return false;
++    }
++    memcpy(copy, event, sizeof(ble_evt_t));
++    dispatcher->enqueue(&copy);
++    return true;
++}
++
+ void BleObject::BleEventDispatcher::enqueue(const ble_evt_t* event) {
+     ble_evt_t* pBleEvent = (ble_evt_t*)allocEventData(sizeof(ble_evt_t));
+     if (!pBleEvent) {
+@@ -754,7 +788,16 @@ os_thread_return_t BleObject::BleEventDispatcher::processBleEventFromThread(void
+             SCOPE_GUARD ({
+                 dispatcher->freeEventData(event);
+             });
++            const bool consumable = phidConsumable(event->header.evt_id);
++            if (consumable && phidCall(PHID_DELEGATE_EVENT, event) == 1) {
++                continue;
++            }
+             switch (event->header.evt_id) {
++                case BLE_GATTS_EVT_SYS_ATTR_MISSING: {
++                    // Only queued while a delegate is installed; it declined or was removed.
++                    sd_ble_gatts_sys_attr_set(event->evt.gatts_evt.conn_handle, nullptr, 0, 0);
++                    break;
++                }
+                 case BLE_GAP_EVT_ADV_SET_TERMINATED: {
+                     BleObject::getInstance().broadcaster()->processAdvStoppedEventFromThread(event);
+                     break;
+@@ -819,6 +862,9 @@ os_thread_return_t BleObject::BleEventDispatcher::processBleEventFromThread(void
+                     break;
+                 }
+             }
++            if (!consumable) {
++                phidCall(PHID_DELEGATE_EVENT, event);
++            }
+         } else {
+             LOG_DEBUG(ERROR, "BLE event thread exited.");
+             break;
+@@ -2485,6 +2531,25 @@ int BleObject::ConnectionsManager::processSecurityEventFromThread(const ble_evt_
+         if (!reject && connection->info.role == BLE_ROLE_PERIPHERAL) {
+             initSecParams(pairingConfig_, secParams);
+             pSecParams = &secParams;
++            phid_sec_params_t phid = {};
++            phid.version = PHID_ABI_VERSION;
++            phid.size = sizeof(phid);
++            phid.conn_handle = connection->info.conn_handle;
++            phid.peer_params = &peerSecParams;
++            phidCall(PHID_DELEGATE_SEC_PARAMS, &phid);
++            if (phid.reject) {
++                reject = true;
++                pSecParams = nullptr;
++                pKeyset = nullptr;
++                connection->peerPublicKey.reset();
++            } else if (phid.bond) {
++                secParams.bond = true;
++                keyset.keys_own.p_enc_key = static_cast<ble_gap_enc_key_t*>(phid.own_enc);
++                keyset.keys_own.p_id_key = static_cast<ble_gap_id_key_t*>(phid.own_id);
++                keyset.keys_peer.p_enc_key = static_cast<ble_gap_enc_key_t*>(phid.peer_enc);
++                keyset.keys_peer.p_id_key = static_cast<ble_gap_id_key_t*>(phid.peer_id);
++                pKeyset = &keyset;
++            }
+         }
+         ret = sd_ble_gap_sec_params_reply(event->evt.gap_evt.conn_handle, reject ? BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP : BLE_GAP_SEC_STATUS_SUCCESS, pSecParams, pKeyset);
+         if (ret != NRF_SUCCESS) {
+@@ -3027,6 +3092,9 @@ void BleObject::GattServer::processGattServerEvents(const ble_evt_t* event, void
+         }
+         case BLE_GATTS_EVT_SYS_ATTR_MISSING: {
+             LOG_DEBUG(TRACE, "BLE GATT Server event: system attribute is missing.");
++            if (s_phid.callback && phidForward(event)) {
++                break;
++            }
+             // No persistent system attributes
+             const uint32_t ret = sd_ble_gatts_sys_attr_set(event->evt.gatts_evt.conn_handle, nullptr, 0, 0);
+             if (ret != NRF_SUCCESS) {
+@@ -3047,8 +3115,17 @@ void BleObject::GattServer::processGattServerEvents(const ble_evt_t* event, void
+             BleObject::getInstance().dispatcher()->enqueue(&dataWrittenEvent);
+             break;
+         }
++        case BLE_GATTS_EVT_SC_CONFIRM: {
++            if (s_phid.callback) {
++                phidForward(event);
++            }
++            break;
++        }
+         case BLE_GATTS_EVT_HVN_TX_COMPLETE: {
+             LOG_DEBUG(TRACE, "BLE GATT Server event: notification sent.");
++            if (s_phid.wake) {
++                os_semaphore_give(s_phid.wake, false);
++            }
+             if (gatts->isHvxing_ && gatts->currHvxConnHandle_ == event->evt.gatts_evt.conn_handle) {
+                 gatts->isHvxing_ = false;
+                 os_semaphore_give(gatts->hvxSemaphore_, false);
+@@ -4477,6 +4554,27 @@ ssize_t hal_ble_gatt_client_read(hal_ble_conn_handle_t conn_handle, hal_ble_attr
+ }
+ 
+ int hal_ble_internal(int type, void* data, size_t size, void* reserved) {
++    BleLock lk;
++    switch (type) {
++        case PHID_OP_GET_INFO: {
++            CHECK_TRUE(data && size >= sizeof(phid_info_t), SYSTEM_ERROR_INVALID_ARGUMENT);
++            auto info = static_cast<phid_info_t*>(data);
++            info->version = PHID_ABI_VERSION;
++            info->size = sizeof(phid_info_t);
++            info->abi_version = PHID_ABI_VERSION;
++            info->caps = PHID_CAP_SEC_DELEGATE | PHID_CAP_SYS_ATTR_DELEGATE | PHID_CAP_TX_WAKE | PHID_CAP_SC_CONFIRM;
++            return SYSTEM_ERROR_NONE;
++        }
++        case PHID_OP_SET_DELEGATE: {
++            CHECK_TRUE(data && size >= sizeof(phid_delegate_t), SYSTEM_ERROR_INVALID_ARGUMENT);
++            auto d = static_cast<const phid_delegate_t*>(data);
++            s_phid.callback = nullptr;
++            s_phid.wake = static_cast<os_semaphore_t>(d->wake_semaphore);
++            s_phid.context = d->context;
++            s_phid.callback = d->callback;
++            return SYSTEM_ERROR_NONE;
++        }
++    }
+     return SYSTEM_ERROR_NOT_SUPPORTED;
+ }
+ 
+-- 
+2.55.0
+
