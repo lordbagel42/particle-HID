@@ -210,6 +210,7 @@ Callbacks (`onStatus`, `onLeds`) run on the HID worker thread. Keep them short, 
 | [`mouse`](examples/mouse/mouse.cpp) | Draws circles; click on a button |
 | [`gamepad`](examples/gamepad/gamepad.cpp) | Buttons, a thumbstick, and a trigger |
 | [`cloud-bringup`](examples/cloud-bringup/cloud-bringup.cpp) | Keyboard driven and observed over the Particle cloud, for remote testing |
+| [`cloud-gamepad`](examples/cloud-gamepad/cloud-gamepad.cpp) | Gamepad driven over the Particle cloud, with a demo that sweeps every control |
 | [`haven-badge`](examples/haven-badge/haven-badge.cpp) | Keyboard plus a custom LED service, used with `tools/badge-led` |
 
 Build one with `particle compile boron examples/keyboard --target 6.6.0`. The examples don't bundle the patch, so flash it by hand first or copy an example into a project with `assetOtaDir` set.
