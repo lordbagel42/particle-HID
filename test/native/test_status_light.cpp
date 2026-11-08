@@ -5,10 +5,11 @@ using namespace phid;
 
 namespace {
 
-HidStatus st(HidState state, bool pairing = false) {
+HidStatus st(HidState state, bool pairing = false, uint8_t bondCount = 0) {
     HidStatus s;
     s.state = state;
     s.pairing = pairing;
+    s.bondCount = bondCount;
     return s;
 }
 
@@ -90,8 +91,19 @@ TEST(status_light_pairing_double_blips_every_two_seconds) {
     CHECK(!l.update(900, st(HidState::Advertising, true), 0, 0).show);
     CHECK(!l.update(2499, st(HidState::Advertising, true), 0, 0).show);
     CHECK_EQ(l.update(2550, st(HidState::Advertising, true), 0, 0).rgb, kBlue);
-    // A connected host during the pairing window isn't "pairing mode".
-    CHECK(!l.update(4500, st(HidState::Connected, true), 0, 0).show);
+    // A window opened on purpose (there are bonds) keeps blinking while a host is connected.
+    CHECK_EQ(l.update(4550, st(HidState::Connected, true, 1), 0, 0).rgb, kBlue);
+    CHECK(!l.update(6550, st(HidState::Connected, false, 1), 0, 0).show);
+}
+
+TEST(status_light_open_ended_pairing_stops_blinking_once_connected) {
+    // No bonds: the window never closes (unbonded dev mode, or a host that won't bond).
+    StatusLight l;
+    l.update(0, st(HidState::Advertising, true), 0, 0);
+    l.update(100, st(HidState::Connected, true), 0, 0);
+    l.update(200, st(HidState::Ready, true), 0, 0); // blue "ready" flashes, then quiet
+    CHECK(!l.update(2050, st(HidState::Ready, true), 0, 0).show);
+    CHECK(!l.update(4050, st(HidState::Ready, true), 0, 0).show);
 }
 
 TEST(status_light_failure_interrupts_pairing_then_pairing_resumes) {

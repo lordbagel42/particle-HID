@@ -94,6 +94,9 @@ public:
     // Bluetooth status on the RGB LED (default), on a plain LED such as D7, or nowhere.
     BleHidClass& statusLed(StatusLed mode);
     BleHidClass& statusLed(uint16_t pin);
+    // Clicking MODE this many times opens pairing for 2 minutes: 3 (default) to 5, or 0
+    // to turn it off. Device OS uses 1 click (signal strength) and 2 (power off).
+    BleHidClass& pairingButton(uint8_t clicks);
     // When the system part lacks the patch, begin() installs the patched
     // system part bundled as an asset (assetOtaDir=lib/particle-hid/assets)
     // and the device resets. Default on; does nothing without the asset.

@@ -18,7 +18,7 @@ constexpr Step kPaired[] = {{1000, StatusLight::kGreen}};
 constexpr Step kDisconnected[] = {{250, StatusLight::kOrange}, {250, kDark}, {250, StatusLight::kOrange}};
 constexpr Step kFailed[] = {{80, StatusLight::kRed}, {80, kDark}, {80, StatusLight::kRed}, {80, kDark},
         {80, StatusLight::kRed}};
-// Pairing repeats this every kPairingPeriod while the device advertises for a new host.
+// Pairing repeats this every kPairingPeriod while the pairing window is open.
 constexpr Step kPairing[] = {{100, StatusLight::kBlue}, {150, kDark}, {100, StatusLight::kBlue}};
 constexpr uint32_t kPairingPeriod = 2000;
 
@@ -91,7 +91,10 @@ StatusLight::Output StatusLight::update(uint32_t now, const HidStatus& s, uint32
         event_ = Event::None;
     }
 
-    const bool pairing = s.state == HidState::Advertising && s.pairing;
+    // While connected, only a window someone opened on purpose (there are bonds)
+    // counts; with no bonds the window stays open for good and would blink forever.
+    const bool linkUp = s.state == HidState::Connected || s.state == HidState::Ready;
+    const bool pairing = s.pairing && (s.state == HidState::Advertising || (linkUp && s.bondCount > 0));
     if (pairing && !pairing_) {
         pairingAt_ = now;
     }

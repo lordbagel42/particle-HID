@@ -48,6 +48,7 @@ constexpr uint32_t kScRetryMs = 500;
 constexpr uint8_t kScMaxTries = 10;
 constexpr const char* kBondDir = "/usr/phid";
 constexpr uint16_t kNoPin = 0xFFFF;
+constexpr uint32_t kButtonPairingMs = 120000;
 
 enum class Ev : uint8_t {
     Connected,
@@ -126,6 +127,7 @@ struct Config {
     bool installPatch = true;
     bool ledRgb = true;
     uint16_t ledPin = kNoPin;
+    uint8_t pairClicks = 3;
 };
 
 bool sdAes(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
@@ -267,6 +269,8 @@ struct BleHidImpl {
     bool suspended = false;
     void (*statusCallback)(const HidStatus&) = nullptr;
     HidStatus lastReported;
+    volatile bool buttonPairing = false;
+    bool buttonHooked = false;
     StatusLight light;
     StatusLight::Output lightOut;
     // Above the network and cloud status, below listening mode and updates.
@@ -1190,11 +1194,27 @@ struct BleHidImpl {
         }
     }
 
+    // May run in an ISR: only set a flag for the worker.
+    static void onButton(system_event_t, int param);
+
     void work() {
         while (!stopping) {
             os_semaphore_take(wake, 20, false);
             if (stopping) {
                 break;
+            }
+            if (buttonPairing) {
+                buttonPairing = false;
+                bool longer;
+                {
+                    platform::Guard g;
+                    longer = pairingOpen &&
+                            (pairingForever || (int32_t)(pairingUntil - (platform::millis() + kButtonPairingMs)) > 0);
+                }
+                if (!longer) { // never shorten a window the app opened
+                    hidLog.info("MODE button: pairing open for %lu s", (unsigned long)(kButtonPairingMs / 1000));
+                    owner->startPairing(kButtonPairingMs);
+                }
             }
             const uint32_t now = platform::millis();
             pollLinkUnpatched(now);
@@ -1485,6 +1505,11 @@ struct BleHidImpl {
             pinMode(ledPin, OUTPUT);
             digitalWrite(ledPin, LOW);
         }
+        buttonPairing = false; // a click from before begin() doesn't count
+        if (!buttonHooked) {
+            System.on(button_final_click, &BleHidImpl::onButton);
+            buttonHooked = true;
+        }
         transport.impl = this;
         stopping = false;
         exited = false;
@@ -1555,6 +1580,13 @@ namespace {
 BleHidImpl g_impl;
 } // namespace
 
+void BleHidImpl::onButton(system_event_t, int param) {
+    const uint8_t clicks = g_impl.cfg.pairClicks;
+    if (clicks && system_button_clicks(param) == clicks && g_impl.started) {
+        g_impl.buttonPairing = true;
+    }
+}
+
 BleHidClass BleHid;
 
 BleHidClass& BleHidClass::name(const char* n) {
@@ -1620,6 +1652,11 @@ BleHidClass& BleHidClass::statusLed(StatusLed mode) {
 BleHidClass& BleHidClass::statusLed(uint16_t pin) {
     g_impl.cfg.ledRgb = false;
     g_impl.cfg.ledPin = pin;
+    return *this;
+}
+BleHidClass& BleHidClass::pairingButton(uint8_t clicks) {
+    // Device OS acts on 1 and 2 clicks (2 powers off) and counts at most 5.
+    g_impl.cfg.pairClicks = clicks == 0 ? 0 : clicks < 3 ? 3 : clicks > 5 ? 5 : clicks;
     return *this;
 }
 BleHidClass& BleHidClass::installPatch(bool on) {
@@ -1756,6 +1793,7 @@ BleHidClass& BleHidClass::battery(BatterySource) { return *this; }
 BleHidClass& BleHidClass::readyDeadline(uint32_t) { return *this; }
 BleHidClass& BleHidClass::statusLed(StatusLed) { return *this; }
 BleHidClass& BleHidClass::statusLed(uint16_t) { return *this; }
+BleHidClass& BleHidClass::pairingButton(uint8_t) { return *this; }
 BleHidClass& BleHidClass::installPatch(bool) { return *this; }
 BleHidClass& BleHidClass::allowUnbonded(bool) { return *this; }
 int BleHidClass::begin() { return -120; /* SYSTEM_ERROR_NOT_SUPPORTED */ }

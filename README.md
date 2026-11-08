@@ -122,7 +122,7 @@ To flash the patch by hand instead (USB, or without assets), see [`device-os/REA
 
 With no bonds, the device opens pairing on its own and advertises under your name. Pair it from the computer's Bluetooth settings; there is no PIN.
 
-To pair another host later, or to pair again after removing the device on the computer, call `BleHid.startPairing()`, for example from a button held at boot (see [`examples/keyboard`](examples/keyboard/keyboard.cpp)). The device holds one connection at a time, so a host that's still connected (or reconnects) keeps it; turn Bluetooth off on that host while you pair a new one.
+To pair another host later, or to pair again after removing the device on the computer, **click MODE three times** (quick clicks, under a second apart; Device OS powers off on two). That opens pairing for 2 minutes; the LED double-blinks blue while it's open. Clicks do nothing in listening mode. From code, call `BleHid.startPairing()`. The device holds one connection at a time, so a host that's still connected (or reconnects) keeps it; turn Bluetooth off on that host while you pair a new one.
 
 Outside pairing mode the device is invisible to new hosts: it advertises only to bonded hosts (a SoftDevice whitelist, which also resolves their private addresses), isn't discoverable, and ignores connection and scan requests from anyone else. With no bonds and pairing closed, it doesn't advertise at all.
 
@@ -136,7 +136,7 @@ Outside pairing mode the device is invisible to new hosts: it advertises only to
 
   | Pattern | Meaning |
   | --- | --- |
-  | Blue double blink every 2 s | Pairing mode: advertising for a new host |
+  | Blue double blink every 2 s | Pairing window open: a new host can pair once nothing else is connected |
   | 3 quick blue flashes | A known host connected and reports are flowing |
   | Green for 1 s | A new host paired and is ready |
   | 2 orange flashes | The host disconnected |
@@ -167,6 +167,7 @@ For bring-up only, `BleHid.allowUnbonded(true)` runs without the patch and witho
 | `battery(BatterySource::Auto / Manual / None)` | Battery service. Auto reads the fuel gauge. |
 | `readyDeadline(ms)` | How long input waits for a host before it's dropped (default 2000). |
 | `statusLed(StatusLed::Rgb / StatusLed::None)`, `statusLed(pin)` | Where Bluetooth status shows: RGB LED overlays (default), a plain LED, or nowhere. |
+| `pairingButton(clicks)` | MODE clicks that open pairing: 3 (default) to 5, or 0 for off. Device OS uses 1 and 2. |
 | `installPatch(bool)` | Install the bundled patched system part when it's missing (default on). |
 
 At runtime:
