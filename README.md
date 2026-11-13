@@ -153,6 +153,21 @@ The library never half-works. On a system part without the patch and no bundled 
 
 For bring-up only, `BleHid.allowUnbonded(true)` runs without the patch and without bonding. Linux usually accepts that; other hosts usually don't, and LED and Protocol Mode writes aren't seen.
 
+## Battery life
+
+On a Boron, cellular is the battery cost, not Bluetooth. Particle's datasheet figures for the Boron LTE, at 3.6 V:
+
+| State | Typical current |
+| --- | --- |
+| Cloud connected, idle | 17.9 mA (more with weak signal) |
+| Cellular off, MCU running (Device OS never sleeps the CPU while your app runs) | 3.9 mA |
+| Ultra-low-power sleep, BLE connected | 0.44 mA |
+
+The library adds little on top of the second row: one BLE connection with peripheral latency (`ConnectionPreset::Balanced` by default, `LowPower` for less) and a worker that wakes every 20 ms. So with a 300 mAh battery, an always-connected device lasts well under a day, while one with cellular off lasts a few days. To get there:
+
+- Use `SYSTEM_MODE(SEMI_AUTOMATIC)` and connect to the cloud only when needed, then `Particle.disconnect()` and `Cellular.off()`. Leave it on while `System.updateStatus()` reports an update in progress or pending. [`examples/haven-badge`](examples/haven-badge/haven-badge.cpp) keeps the cloud on for 5 minutes after boot and on request over Bluetooth, and checks in once an hour just long enough to pick up a pending firmware update.
+- The RGB LED draws current too; `RGB.brightness()` lowers it for both the system status and the library's overlays.
+
 ## API
 
 `BleHid` (a single instance, like `BLE`). Configure before `begin()`:

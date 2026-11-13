@@ -8,13 +8,23 @@
 // "status" hands the LED back to Device OS (normal breathing cyan, etc.).
 // Reading the characteristic returns the current command.
 //
-// Cloud (for remote testing): event badge/led on every command, variable "hid",
+// Power: cellular is most of the battery draw, so the cloud is off except for
+// 5 minutes after boot (press RESET to flash it over the air), a short hourly
+// check-in that only looks for a firmware update, and on request:
+//   cloud       connect for 15 minutes (again to extend)
+//   cloud off   disconnect and turn cellular off now
+//   battery     reading the characteristic then returns charge and voltage
+// The cloud stays up while an update is in progress, and up to 10 more minutes while one is pending.
+//
+// Cloud (while connected): event badge/led on every command, variable "hid",
 // functions "type", "pair", "forget".
 
 #include "Particle.h"
 #include "ParticleHid.h"
 
 using namespace phid;
+
+SYSTEM_MODE(SEMI_AUTOMATIC);
 
 SerialLogHandler logHandler(LOG_LEVEL_WARN, {{"hid", LOG_LEVEL_INFO}, {"app", LOG_LEVEL_INFO}});
 
@@ -68,9 +78,80 @@ bool parseColor(const char* s, uint32_t* rgb) {
     return false;
 }
 
+constexpr uint32_t kCloudAtBootMs = 5 * 60 * 1000;
+constexpr uint32_t kCloudOnRequestMs = 15 * 60 * 1000;
+constexpr uint32_t kCheckInEveryMs = 60 * 60 * 1000;  // counted from the end of the last cloud session
+constexpr uint32_t kCheckInGiveUpMs = 3 * 60 * 1000;  // no signal: try again next hour
+constexpr uint32_t kCheckInListenMs = 20 * 1000;      // the cloud says whether an update is pending right after connecting
+constexpr uint32_t kPendingWaitMs = 10 * 60 * 1000;   // how long a pending update may keep the cloud up past its window
+bool cloudWanted = false;
+uint32_t cloudFrom = 0;
+uint32_t cloudFor = 0;
+uint32_t cloudEndedAt = 0;
+bool checkingIn = false;
+uint32_t checkInConnectedAt = 0;
+
+void cloudOn(uint32_t ms) {
+    cloudWanted = true;
+    cloudFrom = millis();
+    cloudFor = ms;
+    checkingIn = false;
+}
+
+// Cellular costs about 4x everything else together, so it's only on when asked.
+void manageCloud() {
+    if (!cloudWanted) {
+        if (millis() - cloudEndedAt < kCheckInEveryMs) {
+            return;
+        }
+        Log.info("cloud check-in");
+        cloudOn(kCheckInGiveUpMs);
+        checkingIn = true;
+        checkInConnectedAt = 0;
+    }
+    if (checkingIn && Particle.connected()) {
+        if (!checkInConnectedAt) {
+            checkInConnectedAt = millis();
+        } else if (millis() - checkInConnectedAt >= kCheckInListenMs) {
+            cloudFor = 0; // done, unless an update is pending (below)
+        }
+    }
+    const int update = System.updateStatus();
+    const bool updating = update == SYSTEM_UPDATE_STATUS_IN_PROGRESS ||
+            (update == SYSTEM_UPDATE_STATUS_PENDING && millis() - cloudFrom < cloudFor + kPendingWaitMs);
+    if (millis() - cloudFrom < cloudFor || updating) {
+        if (!Particle.connected()) {
+            Particle.connect(); // no-op while already connecting
+        }
+        return;
+    }
+    cloudWanted = false;
+    checkingIn = false;
+    cloudEndedAt = millis();
+    Log.info("cloud off");
+    Particle.disconnect();
+    Cellular.off();
+}
+
+void showBattery() {
+    FuelGauge fuel;
+    char v[kMaxCommand + 1];
+    snprintf(v, sizeof(v), "%.2f%% %.3fV", fuel.getNormalizedSoC(), fuel.getVCell());
+    ledChar.setValue(v);
+}
+
 void applyLed(const char* cmd) {
     uint32_t rgb = 0;
-    if (!strcasecmp(cmd, "status") || !strcasecmp(cmd, "auto")) {
+    if (!strcasecmp(cmd, "cloud")) {
+        cloudOn(kCloudOnRequestMs);
+        return;
+    } else if (!strcasecmp(cmd, "cloud off")) {
+        cloudOn(0);
+        return;
+    } else if (!strcasecmp(cmd, "battery")) {
+        showBattery();
+        return;
+    } else if (!strcasecmp(cmd, "status") || !strcasecmp(cmd, "auto")) {
         RGB.control(false); // back to the system status LED
     } else if (parseColor(cmd, &rgb)) {
         RGB.control(true);
@@ -123,6 +204,8 @@ void setup() {
     // add or change them; hosts that cached the old table keep typing meanwhile.
     BLE.addCharacteristic(ledChar);
     ledChar.setValue(current);
+
+    cloudOn(kCloudAtBootMs);
 }
 
 void loop() {
@@ -134,6 +217,7 @@ void loop() {
         }
         applyLed(cmd);
     }
+    manageCloud();
     static uint32_t lastPublish;
     if (publishCurrent && Particle.connected() && millis() - lastPublish >= 1100) {
         if (Particle.publish("badge/led", current)) {
